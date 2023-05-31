@@ -1,0 +1,114 @@
+variables:
+- name: projectDirectory
+  value: '.'
+- group: keystore
+- name: androidKeystorePassword
+  value: $[variables.ANDROID_KEYSTORE_PASSWORD]
+- name: androidKeystoreAlias
+  value: $[variables.ANDROID_KEYSTORE_ALIAS]
+- name: androidKeystorePrivateKeyPassword
+  value: $[variables.ANDROID_KEYSTORE_PRIVATE_KEY_PASSWORD]
+- group: firebase
+- name: firebaseToken
+  value: $[variables.FIREBASE_TOKEN]
+- name: firebaseAndroidAppId
+  value: $[variables.FIREBASE_ANDROID_APP_ID]
+
+trigger:
+- master
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+- task: FlutterInstall@0
+  inputs:
+    channel: 'stable'
+    version: 'latest'
+  displayName: 'Install latest Flutter SDK stable version'
+
+- task: FlutterAnalyzeTask@0
+  inputs:
+    projectDirectory: '$(projectDirectory)'
+    extraArgs: '--fatal-warnings'
+  displayName: 'Run Flutter analyzer'
+    
+- task: FlutterTest@0
+  inputs:
+    generateCodeCoverageReport: true
+    projectDirectory: '$(projectDirectory)'
+  displayName: 'Run Flutter tests'
+
+- task: CopyFiles@2
+  inputs:
+    SourceFolder: '$(projectDirectory)/coverage'
+    contents: 'lcov.info'
+    targetFolder: '$(build.artifactStagingDirectory)'
+  displayName: 'Copy code coverage file to artifacts directory'
+
+- script: pip install lcov_cobertura
+  displayName: 'Install lcov_cobertura python package'
+
+- task: PythonScript@0
+  inputs:
+    scriptSource: inline
+    script: |
+      import argparse
+      from lcov_cobertura import LcovCobertura
+      parser = argparse.ArgumentParser()
+      parser.add_argument('--cov_file_path', '-c', help='Code coverage file path', type= str)
+      parser.add_argument('--output_dir', '-o', help='Cobertura XML file directory', type= str)
+      args = parser.parse_args()
+      coverage_file = open(args.cov_file_path, 'r')
+      coverage_file_content = coverage_file.read()
+      converter = LcovCobertura(coverage_file_content)
+      cobertura_xml_content = converter.convert()
+      cobertura_xml_file = open(f'{args.output_dir}/cobertura.xml', 'w')
+      cobertura_xml_file.write(cobertura_xml_content)
+      cobertura_xml_file.close()
+    arguments: --cov_file_path $(build.artifactStagingDirectory)/lcov.info --output_dir $(build.artifactStagingDirectory)
+  displayName: 'Python script -> Convert lcov.info into cobertura.xml'  
+
+- task: PublishCodeCoverageResults@1
+  inputs:
+    codeCoverageTool: Cobertura
+    summaryFileLocation: '$(build.artifactStagingDirectory)/cobertura.xml'
+  displayName: 'Publish code coverage results'
+
+- task: FlutterBuild@0
+  inputs:
+    target: apk
+    projectDirectory: $(projectDirectory)
+  displayName: 'Build app'
+
+- task: AndroidSigning@3
+  displayName: 'Signing and aligning APK file(s) **/*.apk'
+  inputs:
+    apkFiles: '**/*.apk'
+    apksign: true
+    apksignerKeystoreFile: people-app-upload-keystore.jks
+    apksignerKeystorePassword: '$(androidKeystorePassword)'
+    apksignerKeystoreAlias: '$(androidKeystoreAlias)'
+    apksignerKeyPassword: '$(androidKeystorePrivateKeyPassword)'
+
+- task: CopyFiles@2
+  inputs:
+    contents: '**/*.apk'
+    targetFolder: '$(build.artifactStagingDirectory)'
+  displayName: 'Copy app to artifacts directory'
+
+- script: |
+    echo 'Installing Firebase CLI...'
+    curl -sL https://firebase.tools | bash
+    firebase --version
+    echo 'Deploying to Firebase...'
+    firebase appdistribution:distribute $(build.artifactStagingDirectory)/build/app/outputs/flutter-apk/app-release.apk  \
+    --token $(firebaseToken)  \
+    --app $(firebaseAndroidAppId)  \
+    --release-notes 'Deploy apk from Azure DevOps'
+  displayName: 'Deploy app to Firebase'
+
+- task: PublishBuildArtifacts@1
+  inputs:
+    artifactName: 'drop'
+  displayName: 'Publish artifacts'
